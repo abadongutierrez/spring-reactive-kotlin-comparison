@@ -42,6 +42,15 @@ Reactor event-loop thread
   └── response returned to client               ← happens immediately
 ```
 
+### Suspending execution
+
+Reactor does not suspend in the traditional sense. There is no "pause point" in the code.
+Instead, the pipeline is a graph of callbacks: when `save(product)` emits a value,
+Reactor invokes the next operator (`doOnSuccess`) on whatever thread produced the signal.
+The event-loop thread is never held waiting — it moves on to other work the moment there
+is no signal to process. "Suspension" here is implicit: the continuation is encoded as
+the next operator in the chain, assembled at declaration time and executed reactively.
+
 ### Fire-and-forget mechanism
 
 `.subscribe()` is called without chaining the result back into the main `Mono`. This
@@ -106,6 +115,27 @@ Reactor event-loop thread (via mono { })
 
 `serviceScope` is built with `SupervisorJob`, meaning a failure in one `launch` does not
 cancel the scope or affect other coroutines.
+
+### Suspending execution
+
+`suspend` functions are the core mechanism. When the Kotlin compiler sees a `suspend fun`,
+it rewrites it into a state machine where each `await` point is a suspension point. At
+`awaitSingle()`, the coroutine saves its local state (variables, position in the function)
+and yields the underlying thread back to the pool. When the `Mono` emits a value,
+the runtime resumes the coroutine from exactly where it paused, restoring the saved state.
+
+This is explicit suspension: the developer marks where suspension can happen (`awaitSingle`,
+`delay`, etc.) and the compiler generates the state machine. The code reads sequentially
+but executes non-blockingly.
+
+```
+suspend fun createCoroutine(product: Product): Product {
+    val saved = repository.save(product).awaitSingle()  // ← suspend point: thread released here
+    //                                                        thread resumes here with `saved`
+    serviceScope.launch { ... }
+    return saved
+}
+```
 
 ### Fire-and-forget mechanism
 
@@ -176,6 +206,25 @@ Thread pool thread (Spring TaskExecutor)
 the same bean (self-invocation) bypasses the proxy and runs synchronously. That is why
 `AsyncCategoryCounter` is a separate Spring bean.
 
+### Suspending execution
+
+There is no suspension. The `@Async` thread calls `.block()`, which parks the OS thread
+in a wait state until the `Mono` completes. The thread is not released; it is held by the
+OS, consuming a stack and a slot in the thread pool for the entire duration of the I/O
+operation. Other work submitted to the same executor must wait for a free thread.
+
+This is blocking: the thread is alive but doing nothing while waiting. It is the
+traditional Java model — simple to reason about, but costly at scale because thread count
+is bounded and each idle-but-blocked thread still occupies memory (~1 MB stack by default).
+
+```
+Thread pool thread
+  └── countAndLog() runs
+        └── .block() ← OS thread parked here, no work can be done on it
+        └── thread resumes when DB responds
+        └── log result, thread returned to pool
+```
+
 ### Fire-and-forget mechanism
 
 Spring's AOP proxy wraps the method call in a `Runnable` and submits it to the configured
@@ -205,6 +254,7 @@ exceptions are sent to the `AsyncUncaughtExceptionHandler`. If it returns
 | Dimension              | Reactor `.subscribe()`          | Coroutines `launch { }`            | Spring `@Async`                     |
 |------------------------|----------------------------------|-------------------------------------|--------------------------------------|
 | **Abstraction**        | Reactive streams operators       | Structured concurrency              | Thread pool + AOP proxy             |
+| **Suspending execution** | Implicit — continuation encoded as next operator in the chain; event-loop thread never held | Explicit — `suspend` + compiler-generated state machine; thread released at each `await` point | None — OS thread blocked with `.block()` until I/O completes |
 | **Thread usage**       | boundedElastic pool (non-blocking) | Dispatchers.IO (non-blocking)     | Real OS thread (blocking allowed)   |
 | **Readability**        | Operator chains (functional)     | Sequential (imperative style)       | Imperative (familiar Spring style)  |
 | **Fire-and-forget**    | Detached `.subscribe()`          | `launch {}` on owned scope          | Submitted to TaskExecutor           |
