@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: spring-reactive-kotlin
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/reactivedb
+    username: postgres
+    password: postgres
+  sql:
+    init:
+      mode: always
+
+logging:
+  level:
+    org.springframework.r2dbc: DEBUG
